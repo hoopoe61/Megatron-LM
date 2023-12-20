@@ -113,7 +113,7 @@ setuptools.setup(
         'Natural Language :: English',
         'Operating System :: OS Independent',
     ],
-    packages=setuptools.find_packages(include=['megatron.core', 'megatron.core.*'],),
+    packages=setuptools.find_packages(),
     ext_modules=[
         Extension(
             "megatron.core.datasets.helpers",
@@ -122,8 +122,11 @@ setuptools.setup(
             extra_compile_args=extra_compile_args,
         )
     ],
+    python_requires=">=3.6",
+    install_requires=install_requires,
     # Add in any packaged data.
     include_package_data=True,
+    zip_safe=False,
     # PyPI package information.
     keywords=__keywords__,
 )
