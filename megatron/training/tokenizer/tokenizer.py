@@ -5,6 +5,9 @@
 from abc import ABC
 from abc import abstractmethod
 
+import json
+from collections import OrderedDict
+
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
@@ -493,6 +496,12 @@ class _NullTokenizer:
         vocab_size = int(vocab_size)
         self._eos_id = vocab_size
         self.vocab_size = vocab_size+1
+        
+        self.unique_identifiers = OrderedDict()
+        self.unique_identifiers["class"] = type(self).__name__
+        self.unique_identifiers["tokenizer_path"] = list("")
+
+        self.unique_description = json.dumps(self.unique_identifiers, indent=4)
 
     def tokenize(self, text):
         return [int(x) for x in text.split(' ')]
