@@ -122,8 +122,11 @@ setuptools.setup(
             extra_compile_args=extra_compile_args,
         )
     ],
+    python_requires=">=3.6",
+    install_requires=install_requires,
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
+    zip_safe=False,
     keywords=__keywords__,
 )
