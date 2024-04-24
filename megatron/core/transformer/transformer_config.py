@@ -265,10 +265,10 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer blocks are wrapped with CUDA graph."""
 
     # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
-    max_position_embeddings: int = 0
+    #max_position_embeddings: int = 0
     """Deprecated. Do not use."""
 
-    rotary_percent: float = 0
+    #rotary_percent: float = 0
     """Deprecated. Do not use."""
 
     def __post_init__(self):
