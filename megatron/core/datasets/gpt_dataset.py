@@ -216,7 +216,7 @@ class GPTDataset(MegatronDataset):
         return {
             "tokens": tokens,
             "labels": labels,
-            "attention_mask": attention_mask,
+            #"attention_mask": attention_mask,
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
@@ -595,9 +595,11 @@ def _get_ltor_masks_and_position_ids(
     """
     seq_length = data.numel()
 
+    '''
     attention_mask = torch.tril(torch.ones((seq_length, seq_length), device=data.device)).unsqueeze(
         0
     )
+    '''
 
     # Loss mask.
     loss_mask = torch.ones(seq_length, dtype=torch.float, device=data.device)
@@ -623,13 +625,15 @@ def _get_ltor_masks_and_position_ids(
             i = eod_index[j]
             # Mask attention loss.
             if reset_attention_mask:
-                attention_mask[0, (i + 1) :, : (i + 1)] = 0
+                attention_mask = None
+                #attention_mask[0, (i + 1) :, : (i + 1)] = 0
             # Reset positions.
             if reset_position_ids:
                 position_ids[(i + 1) :] -= i + 1 - prev_index
                 prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = attention_mask < 0.5
+    # attention_mask = attention_mask < 0.5
+    attention_mask = None
 
     return attention_mask, loss_mask, position_ids
