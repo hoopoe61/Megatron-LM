@@ -32,7 +32,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         submodules=TransformerLayerSubmodules(
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                #params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=TELayerNormColumnParallelLinear,
                     core_attention=TEDotProductAttention,
