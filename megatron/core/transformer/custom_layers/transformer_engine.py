@@ -460,12 +460,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.qkv_format = 'bshd'
 
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+        if not qkv_format:
+            qkv_format = self.qkv_format
 
         if te_version < packaging.version.Version("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
             # These two arguments did not exist prior to 1.3.0
             packed_seq_kwargs.pop("max_seqlen_q", None)
             packed_seq_kwargs.pop("max_seqlen_kv", None)
+        
+        if 'seqlens' in packed_seq_kwargs:
+            packed_seq_kwargs.pop("seqlens", None)
 
         if self.config.apply_rope_fusion and qkv_format == 'bshd':
             query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]

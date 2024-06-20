@@ -533,7 +533,7 @@ class IndexedDataset(torch.utils.data.Dataset):
                 bin_buffer_file.seek(sequence_pointer)
                 bin_buffer_file.readinto(sequence)
 
-        return (sequence, sequence_mode) if sequence_mode is not None else sequence
+        return (sequence, length, sequence_mode) if sequence_mode is not None else (sequence, length)
 
     @property
     def sequence_lengths(self) -> numpy.ndarray:

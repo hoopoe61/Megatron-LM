@@ -10,6 +10,8 @@ from typing import Dict, Tuple
 import numpy
 import torch
 
+import torch.nn.functional as F
+
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset, MockDataset
@@ -195,7 +197,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The text ids wrapped in a dictionary
         """
-        text, _ = self._query_document_sample_shuffle_indices(idx)
+        text, sample_lengths, _ = self._query_document_sample_shuffle_indices(idx)
 
         text = torch.from_numpy(text).long()
         labels = text[1:].contiguous()
@@ -212,11 +214,14 @@ class GPTDataset(MegatronDataset):
             self.config.reset_attention_mask,
             self.config.eod_mask_loss,
         )
-
+        
+        sample_lengths[-1] = sample_lengths[-1] - 1 #由于label的原因，默认会多取一个值；
+        sample_lengths = F.pad(torch.tensor(sample_lengths, dtype=torch.int32), (0, len(tokens)-len(sample_lengths)), mode='constant', value=0) #pad到seq length的长度，为了broadcast；
         return {
             "tokens": tokens,
             "labels": labels,
             "attention_mask": attention_mask,
+            "sample_lengths": sample_lengths,
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
@@ -241,20 +246,22 @@ class GPTDataset(MegatronDataset):
 
         document_ids = []
         sample_parts = []
+        sample_lengths = []
 
         # Sample spans a single document
         if doc_index_beg == doc_index_end:
             # Add the document id
             document_ids.append(self.document_index[doc_index_beg])
 
-            # Add the entire sample
-            sample_parts.append(
-                self.dataset.get(
-                    self.document_index[doc_index_beg],
-                    offset=doc_index_beg_offset,
-                    length=doc_index_end_offset - doc_index_beg_offset + 1,
-                )
+            
+            s_part, s_length = self.dataset.get(
+                self.document_index[doc_index_beg], #拿到真正的doc的idx位置；
+                offset=doc_index_beg_offset,
+                length=doc_index_end_offset - doc_index_beg_offset + 1,
             )
+            # Add the entire sample
+            sample_parts.append(s_part)
+            sample_lengths.append(s_length)
 
         # Sample spans multiple documents
         else:
@@ -265,12 +272,16 @@ class GPTDataset(MegatronDataset):
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
                 length = None if i < doc_index_end else doc_index_end_offset + 1
-                sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=offset, length=length)
-                )
+
+                s_part, s_length = self.dataset.get(self.document_index[i], offset=offset, length=length)
+                sample_parts.append(s_part)
+                sample_lengths.append(s_length)
+
+        assert len(sample_parts) == len(sample_lengths), f"len(sample_parts) ({len(sample_parts)}) != len(sample_lengths) ({len(sample_lengths)})"
 
         return (
             numpy.array(numpy.concatenate(sample_parts), dtype=numpy.int64),
+            sample_lengths,
             numpy.array(document_ids, dtype=numpy.int64),
         )
 

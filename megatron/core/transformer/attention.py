@@ -17,6 +17,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
+from megatron.core.packed_seq_params import PackedSeqParams
+
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
@@ -260,10 +262,12 @@ class Attention(MegatronModule, ABC):
             inference_params, key, value, rotary_pos_emb
         )
 
+        '''
         if packed_seq_params is not None:
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+        '''
 
         # ================================================
         # relative positional embedding (rotary embedding)
@@ -272,15 +276,15 @@ class Attention(MegatronModule, ABC):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                seqlens = packed_seq_params.seqlens
             else:
-                cu_seqlens_q = cu_seqlens_kv = None
+                seqlens = None
+
             query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q,
+                query, q_pos_emb, config=self.config, cu_seqlens=seqlens,
             )
             key = apply_rotary_pos_emb(
-                key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv,
+                key, k_pos_emb, config=self.config, cu_seqlens=seqlens,
             )
 
             # TODO, can apply positional embedding to value_layer so it has
@@ -311,12 +315,14 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
 
+        '''
         if packed_seq_params is not None:
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        '''
 
         # =================
         # Output. [sq, b, h]

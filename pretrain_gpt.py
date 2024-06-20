@@ -3,6 +3,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from functools import partial
 from typing import Union
 from megatron import get_args
@@ -26,6 +27,7 @@ from megatron.utils import (
 from megatron.arguments import core_transformer_config_from_args
 from megatron.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
@@ -130,6 +132,67 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
 
 
+def unpad_input_for_concatenated_sequences(attention_mask_in_length):
+    """
+    Supports concatenating short samples in one sequence. The attention_mask_in_length is utilized to mask other short samples. It helps efficient training of variant lengths-based samples (e.g., the supervised fine-tuning task in large language model).
+    The motivation for this function is explained [here](https://github.com/Dao-AILab/flash-attention/issues/432#issuecomment-1668822286).
+    
+    For example, if batch = 3 and seqlen = 6, the attention_mask_in_length is:
+        ```
+        [
+          [2, 3, 0, 0, 0, 0],
+          [3, 2, 0, 0, 0, 0],
+          [6, 0, 0, 0, 0, 0]
+        ]
+        ```
+    , which refers to the 3D-attention mask:
+        ```
+        [
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 1, 1, 0, 0],
+            [0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+          ],
+          [
+            [1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1]
+          ]
+        ]
+        ```.
+
+    Arguments:
+        attention_mask_in_length: (batch, seqlen), int, a nonzero number (e.g., 1, 2, 3, etc.) means length of concatenated sequence in b-th batch, and 0 means none.
+    Return:
+        indices: (total_nnz), the indices of non-masked tokens from the flattened input sequence.
+        cu_seqlens: (batch + 1), the cumulative sequence lengths, used to index into hidden_states.
+        max_seqlen_in_batch: int
+    """
+    
+    real_indices_idx = torch.nonzero(attention_mask_in_length.flatten(), as_tuple=False).flatten()
+    seqlens_in_batch = attention_mask_in_length.flatten()[real_indices_idx]
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    # TD [2022-03-04] We don't want to index with a bool mask, because Pytorch will expand the
+    # bool mask, then call nonzero to get the indices, then index with those. The indices is @dim
+    # times larger than it needs to be, wasting memory. It's faster and more memory-efficient to
+    # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
+    # so we write custom forward and backward to make it a bit faster.
+    return cu_seqlens
+
 def forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 
@@ -142,12 +205,27 @@ def forward_step(data_iterator, model: GPTModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+    tokens, labels, loss_mask, attention_mask, sample_lengths, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
-
+    sample_lengths=sample_lengths[sample_lengths != 0]
+    
+    #将sample_lengths加工成cu_seqlens
+    cu_seqlens = unpad_input_for_concatenated_sequences(sample_lengths)
+    
+    '''
+    cu_seqlens_q: Tensor = None
+    cu_seqlens_kv: Tensor = None
+    max_seqlen_q: Tensor = None
+    max_seqlen_kv: Tensor = None
+    '''
+    p_seq_params = PackedSeqParams(
+        seqlens=sample_lengths,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+    )
     output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+                          labels=labels, packed_seq_params=p_seq_params)
 
     return output_tensor, partial(loss_func, loss_mask)
 
