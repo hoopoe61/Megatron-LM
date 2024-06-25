@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
+import dlrover
+
 import os
 import torch
 import torch.nn.functional as F
@@ -25,7 +27,6 @@ from megatron.utils import (
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
-from megatron.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -46,11 +47,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    # Experimental loading arguments from yaml
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
-    else:
-        config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(args)
 
     if args.use_mcore_models:
         if args.spec is not None:
@@ -58,6 +55,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         else:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm)
 
+        print("GOODGOOD")
         model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -70,8 +68,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
         )
     else:
+        assert args.use_mcore_models == True, "WTFWTF"
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
 
         model = megatron.model.GPTModel(
@@ -220,7 +220,7 @@ def forward_step(data_iterator, model: GPTModel):
     max_seqlen_kv: Tensor = None
     '''
     p_seq_params = PackedSeqParams(
-        seqlens=sample_lengths,
+        #seqlens=sample_lengths, #在绝对位置上进行rope，所以不再传递该参数；
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
     )
@@ -246,7 +246,6 @@ def core_gpt_dataset_config_from_args(args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         mock=args.mock_data,
-        mmap_bin_files=args.mmap_bin_files,
         tokenizer=tokenizer,
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
@@ -292,4 +291,5 @@ if __name__ == "__main__":
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
+             extra_args_provider=dlrover.arsenalrun_args,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

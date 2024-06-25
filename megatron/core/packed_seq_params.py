@@ -7,7 +7,7 @@ from torch import Tensor
 class PackedSeqParams:
     # parameters to TEDotProductAttention and fused rope kernels for the `thd` (packed) sequence format,
     qkv_format: str = None
-    seqlens: Tensor = None
+    #seqlens: Tensor = None
     cu_seqlens_q: Tensor = None
     cu_seqlens_kv: Tensor = None
     max_seqlen_q: Tensor = None

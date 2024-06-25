@@ -192,6 +192,10 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
 
+    #t torch.Size([4096, 1, 8, 128]) 
+    #cos_: torch.Size([4096, 1, 1, 128]) 
+    #_rotate_half(t, rotary_interleaved): torch.Size([4096, 1, 8, 128]) 
+    #sin_: torch.Size([4096, 1, 1, 128])
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
 
@@ -212,25 +216,23 @@ def apply_rotary_pos_emb_thd(
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
     '''
-    # 按照for循环来进行处理;
     # cu_seqlens size: [batch_size, seq_length]
     # t size: [seq_length, batch_size, head, head_dim]
-    # 先处理按照batch size进行切分，然后再按照seq_length中的sentence长度进行切分
+    # 按照for循环来进行处理: 先处理按照batch size进行切分，然后再按照seq_length中的sentence长度进行切分
     '''
     
     #seqlens = (cu_seqlens[:, 1:] - cu_seqlens[:, :-1]).tolist()
     seqlens = cu_seqlens.tolist()
+    
+     #拼在一起计算然后再拆开，会更快？
     return torch.cat(
         [
             torch.cat(
             [
                 apply_rotary_pos_emb_bshd(x, freqs[: x.size(0)])
                 for x in torch.split(t_one, seqlens[i]) #按照长度进行了切分；
-            ]) for i, t_one in enumerate(torch.split(t, 1, dim=1))
+            ]) for i, t_one in enumerate(torch.split(t, 1, dim=1)) #按照sample进行了切分；
         ], dim=1)
-
-    #拼在一起再拆开，会更快？
-
 
 def apply_rotary_pos_emb(
     t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None,

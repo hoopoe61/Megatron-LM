@@ -20,6 +20,8 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import safely_set_viewless_tensor_data
 
+from megatron.core.packed_seq_params import PackedSeqParams
+
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
 # Default name for the model parallel rng tracker.
@@ -202,7 +204,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         with torch.no_grad():
-            outputs = run_function(*args)
+            outputs = run_function(*args) #outputs是前向计算得到的结果；
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
@@ -213,7 +215,14 @@ class CheckpointFunction(torch.autograd.Function):
             )
 
         # Store everything.
-        ctx.save_for_backward(*args)
+        args = list(args)
+        if args[-1] is not None:
+            assert(isinstance(args[-1], PackedSeqParams)), "invalid arg in the end of args, not PackedSeqParams"
+            packed_seq_params = args[-1]
+            args[-1] = packed_seq_params.cu_seqlens_q
+            args.append(packed_seq_params.cu_seqlens_kv)
+                            
+        ctx.save_for_backward(*tuple(args))
 
         return outputs
 
@@ -225,6 +234,17 @@ class CheckpointFunction(torch.autograd.Function):
                 "please use .backward() if possible"
             )
         inputs = ctx.saved_tensors
+        # 这里没有做不是PackedSeqParams情况的判断；
+        if inputs[-1] is not None:
+            inputs = list(inputs)
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q = inputs[-2], 
+                cu_seqlens_kv = inputs[-1],
+            )
+            inputs = inputs[:-2]
+            inputs.append(packed_seq_params)
+            inputs = tuple(inputs)
+        
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
@@ -256,8 +276,9 @@ class CheckpointFunction(torch.autograd.Function):
         # filter out non tensor outputs for backward pass
         outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
         torch.autograd.backward(outputs, args)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
-        return (None, None) + grads
+        # PackedSeqParams参数没有grad，需要特殊处理；
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs[:-1])
+        return (None, None) + grads + (None,)
 
 
 def checkpoint(function, distribute_saved_activations, *args):

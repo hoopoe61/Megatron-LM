@@ -133,8 +133,8 @@ def validate_args(args, defaults={}):
         exit()
     del args.checkpoint_activations
 
-    if args.recompute_activations:
-        args.recompute_granularity = 'selective'
+    #if args.recompute_activations:
+    #    args.recompute_granularity = 'selective'
     del args.recompute_activations
 
     # Set input defaults.

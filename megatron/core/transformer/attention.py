@@ -138,6 +138,7 @@ class Attention(MegatronModule, ABC):
             attention_mask,
             rotary_pos_emb,
             attn_mask_type,
+            packed_seq_params,
         )
 
         return hidden_states
@@ -275,10 +276,14 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
+            '''
+            # 使用绝对位置来进行rope，所以这里不再读取seqlens
             if packed_seq_params is not None:
                 seqlens = packed_seq_params.seqlens
             else:
                 seqlens = None
+            '''
+            seqlens = None
 
             query = apply_rotary_pos_emb(
                 query, q_pos_emb, config=self.config, cu_seqlens=seqlens,
@@ -297,7 +302,7 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
+            core_attn_out = self._checkpointed_attention_forward( #flag1: selective recompute
                 query,
                 key,
                 value,
