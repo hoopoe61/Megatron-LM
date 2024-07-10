@@ -1,1 +1,1 @@
-include megatron/core/requirements.txt
+recursive-include megatron *
