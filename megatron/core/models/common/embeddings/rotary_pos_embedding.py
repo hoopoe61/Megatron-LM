@@ -211,7 +211,7 @@ def apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
-
+    '''
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     return torch.cat(
         [
@@ -219,6 +219,23 @@ def apply_rotary_pos_emb_thd(
             for x in torch.split(t, seqlens)
         ]
     ).squeeze(1)
+    '''
+    '''
+    # cu_seqlens size: [batch_size, seq_length]
+    # t size: [seq_length, batch_size, head, head_dim]
+    # 按照for循环来进行处理: 先处理按照batch size进行切分，然后再按照seq_length中的sentence长度进行切分
+    '''
+    
+    seqlens = cu_seqlens.tolist()
+    
+    return torch.cat(
+        [
+            torch.cat(
+            [
+                apply_rotary_pos_emb_bshd(x, freqs[: x.size(0)])
+                for x in torch.split(t_one, seqlens[i]) #按照长度进行了切分；
+            ]) for i, t_one in enumerate(torch.split(t, 1, dim=1)) #按照sample进行了切分；
+        ], dim=1)
 
 
 def apply_rotary_pos_emb(

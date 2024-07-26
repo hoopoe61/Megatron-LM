@@ -9,6 +9,8 @@ from typing import Dict, Optional, Tuple
 import numpy
 import torch
 
+import torch.nn.functional as F
+
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -169,9 +171,11 @@ class GPTDataset(MegatronDataset):
         """
         if idx is None:
             # Batch padding sequence so the index does not matter
-            text, _ = self._query_document_sample_shuffle_indices(0)
+            #text, _ = self._query_document_sample_shuffle_indices(0)
+            text, sample_lengths, _ = self._query_document_sample_shuffle_indices(0)
         else:
-            text, _ = self._query_document_sample_shuffle_indices(idx)
+            #text, _ = self._query_document_sample_shuffle_indices(idx)
+            text, sample_lengths, _ = self._query_document_sample_shuffle_indices(idx)
 
         text = torch.from_numpy(text).long()
         if self.config.add_extra_token_to_sequence:
@@ -215,11 +219,15 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
+        sample_lengths[-1] = sample_lengths[-1] - self.config.add_extra_token_to_sequence #add_extra_token_to_sequence是否多引入一个token，作为后续的label使用；
+        sample_lengths = F.pad(torch.tensor(sample_lengths, dtype=torch.int32), (0, len(tokens)-len(sample_lengths)), mode='constant', value=0) #pad到seq length的长度，为了broadcast；
+        
         if self.config.create_attention_mask:
             return {
                 "tokens": tokens,
                 "labels": labels,
                 "attention_mask": attention_mask,
+                "sample_lengths": sample_lengths,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
@@ -227,6 +235,7 @@ class GPTDataset(MegatronDataset):
             return {
                 "tokens": tokens,
                 "labels": labels,
+                "sample_lengths": sample_lengths,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
@@ -251,6 +260,7 @@ class GPTDataset(MegatronDataset):
 
         document_ids = []
         sample_parts = []
+        sample_lengths = []
 
         # Sample spans a single document
         if doc_index_beg == doc_index_end:
@@ -258,6 +268,7 @@ class GPTDataset(MegatronDataset):
             document_ids.append(self.document_index[doc_index_beg])
 
             # Add the entire sample
+            '''
             sample_parts.append(
                 self.dataset.get(
                     self.document_index[doc_index_beg],
@@ -267,6 +278,15 @@ class GPTDataset(MegatronDataset):
                     + self.config.add_extra_token_to_sequence,
                 )
             )
+            '''
+            s_part, s_length = self.dataset.get(
+                self.document_index[doc_index_beg], #拿到真正的doc的idx位置；
+                offset=doc_index_beg_offset,
+                length=doc_index_end_offset - doc_index_beg_offset + self.config.add_extra_token_to_sequence,
+            )
+            # Add the entire sample
+            sample_parts.append(s_part)
+            sample_lengths.append(s_length)
 
         # Sample spans multiple documents
         else:
@@ -281,9 +301,17 @@ class GPTDataset(MegatronDataset):
                     if i < doc_index_end
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
+                '''
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=offset, length=length)
                 )
+                '''
+                s_part, s_length = self.dataset.get(self.document_index[i], offset=offset, length=length)
+                sample_parts.append(s_part)
+                sample_lengths.append(s_length)
+
+        assert len(sample_parts) == len(sample_lengths), f"len(sample_parts) ({len(sample_parts)}) != len(sample_lengths) ({len(sample_lengths)})"
+        
         assert len(document_ids) == len(
             sample_parts
         ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
@@ -299,6 +327,7 @@ class GPTDataset(MegatronDataset):
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
+            sample_lengths,
             numpy.array(document_ids, dtype=numpy.int64),
         )
 
