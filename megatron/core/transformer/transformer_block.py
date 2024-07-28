@@ -235,6 +235,7 @@ class TransformerBlock(MegatronModule):
                 context,
                 context_mask,
                 rotary_pos_emb,
+                packed_seq_params,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -263,6 +264,7 @@ class TransformerBlock(MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    packed_seq_params,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -273,6 +275,7 @@ class TransformerBlock(MegatronModule):
                     context,
                     context_mask,
                     rotary_pos_emb,
+                    packed_seq_params,
                 )
 
         if self.config.recompute_method == 'uniform':
