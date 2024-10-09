@@ -103,7 +103,6 @@ setuptools.setup(
         )
     ],
     # Add in any packaged data.
-    python_requires=">=3.6",
     include_package_data=True,
     # PyPI package information.
     zip_safe=False,
