@@ -1,2 +1,1 @@
-include megatron/core/requirements.txt
-include megatron/core/README.md
+recursive-include megatron *
