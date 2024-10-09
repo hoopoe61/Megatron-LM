@@ -104,7 +104,6 @@ setuptools.setup(
     ],
     # Add in any packaged data.
     python_requires=">=3.6",
-    install_requires=install_requires,
     include_package_data=True,
     # PyPI package information.
     zip_safe=False,
