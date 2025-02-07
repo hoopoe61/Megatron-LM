@@ -1,2 +1,6 @@
 torch
 packaging
+nltk
+six
+regex
+pybind11
