@@ -120,7 +120,6 @@ setuptools.setup(
             optional=True,
         )
     ],
-    python_requires=">=3.6",
     # Add in any packaged data.
     include_package_data=True,
     zip_safe=False,
