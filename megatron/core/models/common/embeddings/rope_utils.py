@@ -208,7 +208,7 @@ def _apply_rotary_pos_emb_thd(
     #    -> Use offset-based mapping for exact positional correspondence
     # 2. Otherwise: freqs contains only max sequence length positions
     #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
+    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]: #freqs.size(0)：max_seq_len; cu_seqlens[-1]：total_seq_len;
         # CASE 1: Exact mapping with offsets
         # Build packed freqs in one pass, then apply once to the whole packed tensor
         sequence_splits = torch.split(t, seqlens)
@@ -232,11 +232,11 @@ def _apply_rotary_pos_emb_thd(
     else:
         # CASE 2: Traditional mapping without offsets
         # Build packed freqs for all sequences using the standard mapping, then apply once
-        sequence_splits = torch.split(t, seqlens)
+        sequence_splits = torch.split(t, seqlens) #得到每个sequence的实际长度
         freqs_packed = torch.cat(
             [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
             dim=0,
-        )
+        ) #freqs_packed: 针对sequence_splits内容生成出来的freqs的记录
 
         return _apply_rotary_pos_emb_bshd(
             t.unsqueeze(1),

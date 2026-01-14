@@ -94,6 +94,7 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
+from megatron.training import get_args
 
 @dataclass
 class SelfAttentionSubmodules:
@@ -143,6 +144,11 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        args = get_args()
+        self.reset_attention_mask = args.reset_attention_mask
+        self.reset_position_ids = args.reset_position_ids
+        if self.reset_position_ids:
+            assert self.reset_attention_mask, "reset_position_ids can be set to True only when reset_attention_mask is enabled"
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -795,6 +801,15 @@ class Attention(MegatronModule, ABC):
             )
 
         if packed_seq_params is not None:
+            # 如果开启了reset_attention_mask，在这里进行qkv的转换
+            # before : [s, b, h, d] -> after : [(b s), 1, h, d]
+            if self.reset_attention_mask:
+                assert hasattr(packed_seq_params, "qkv_format") and packed_seq_params.qkv_format == "thd", f"qkv_format must be set to thd when reset_attention_mask is enabled, but got {packed_seq_params.qkv_format}"
+                assert inference_context == None, f"only inference_context=None is checked for enabled reset_attention_mask"
+                seq_len_recorder = query.size(0)
+                batch_recorder = query.size(1)
+                query, key, value = [rearrange(x, 's b ... -> (b s) 1 ...') for x in (query, key, value)]
+
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -818,6 +833,10 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
                 else:
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                
+                if not self.reset_position_ids:
+                    # 创建一个假的cu_seqlens，这样就可以走thd + 不reset position ids的逻辑
+                    cu_seqlens_q = cu_seqlens_kv = torch.arange(0, query.size(0) + 1, step=seq_len_recorder, dtype=torch.int32, device=query.device)
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
@@ -910,6 +929,10 @@ class Attention(MegatronModule, ABC):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        
+        if self.reset_attention_mask:
+            core_attn_out = rearrange(core_attn_out, '(b s) 1 ... -> s b ...', b=batch_recorder)
+
         nvtx_range_pop(suffix="core_attention")
 
         # =================

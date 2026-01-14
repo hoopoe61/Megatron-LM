@@ -34,13 +34,15 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
+from megatron.core.packed_seq_params import PackedSeqParams
+
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, reset_attention_mask=False):
     """Generate a batch."""
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage):
+    if not reset_attention_mask and not is_first_or_last_pipeline_stage(vp_stage):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
@@ -48,6 +50,10 @@ def get_batch(data_iterator, vp_stage=None):
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
+
+    if reset_attention_mask and not is_first_or_last_pipeline_stage(vp_stage):
+        assert "attention_mask" in batch.keys()
+        return None, None, None, batch["attention_mask"], None
 
     return batch.values()
 
@@ -117,6 +123,29 @@ def loss_func(
 
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
+def mask_to_seq_lens(mask_2d: torch.Tensor):
+    """
+    mask_2d: [T, T] packed causal attention mask
+    return: 1D tensor of seq_lens
+    """         
+    T = mask_2d.size(0)
+    
+    # 每一行第一个 False 的列索引, Megatron使用False表示不Mask
+    first_one = mask_2d.int().argmin(dim=1)
+    # sequence 起点：first_one 发生变化的位置
+    starts = torch.cat( 
+        [
+            torch.tensor([0], device=mask_2d.device),
+            torch.nonzero(first_one[1:] != first_one[:-1], as_tuple=False)
+            .flatten()
+            + 1,
+        ]
+    )
+    # 计算每段长度
+    ends = torch.cat([starts[1:], torch.tensor([T], device=mask_2d.device)])
+    seq_lens = ends - starts
+
+    return seq_lens
 
 def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
@@ -134,8 +163,40 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage, args.reset_attention_mask)
     timers('batch-generator').stop()
+
+    packed_seq_params = None
+    if args.reset_attention_mask:
+        # 根据attention_mask生成cu_seq_len的内容
+        # attention_mask: [B, 1, S, S]; mask_to_seq_lens 输出当前 batch 每条样本的长度
+        assert args.create_attention_mask_in_dataloader and attention_mask is not None, "attention_mask must be created in dataloader when reset_attention_mask is enabled"
+        all_seq_lens = []
+        for i in range(attention_mask.size(0)):
+            seq_lens_b = mask_to_seq_lens(attention_mask[i].squeeze(0))
+            all_seq_lens.append(seq_lens_b)
+        all_seq_lens = torch.cat(all_seq_lens, dim=0)
+
+        cu_seqlens = torch.empty(
+            all_seq_lens.numel() + 1, dtype=torch.int32, device=attention_mask.device
+        )
+        cu_seqlens[0] = 0
+        torch.cumsum(all_seq_lens, dim=0, dtype=torch.int32, out=cu_seqlens[1:])
+
+        if args.reset_position_ids:
+            max_seqlens = int(all_seq_lens.max())
+        else:
+            # 如果没有使用reset_position_ids，则max_seqlens为实际的seq length
+            max_seqlens = int(attention_mask.size(2))
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlens,
+            max_seqlen_kv=max_seqlens,
+            qkv_format='thd',
+        )
+        attention_mask = None # attention_mask is not used any more, set to None to save memory
 
     with stimer:
         if args.use_legacy_models:
@@ -145,12 +206,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -158,7 +219,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None):
-    return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
+    return parallel_state.get_tensor_model_parallel_rank() == 0
+    #return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):

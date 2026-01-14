@@ -550,6 +550,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+        else:
+            _broadcast(batch['attention_mask'])
 
     else:
 
@@ -610,6 +612,12 @@ def get_batch_on_this_tp_rank(data_iterator):
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(attention_mask)
+        else:
+            tokens = None
+            labels = None
+            loss_mask = None
+            position_ids = None
             _broadcast(attention_mask)
 
         batch = {
