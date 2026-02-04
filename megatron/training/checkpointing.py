@@ -624,13 +624,17 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
                         with open_file(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
-                with open_file(tracker_filename, 'w') as f:
-                    f.write("release" if release else str(iteration))
-                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
-                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
-                print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
-                             f'[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, '
-                             f'p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                
+                if optimizer.if_skip:
+                    print_rank_0(f'  NOTICE: iteration: {int(iteration):7d} has abnormal grad norm, skip to write iteration {int(iteration):7d} to {tracker_filename}, only save the ckpt.')
+                else:
+                    with open_file(tracker_filename, 'w') as f:
+                        f.write("release" if release else str(iteration))
+                    tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
+                    pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
+                    print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
+                                f'[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, '
+                                f'p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -1114,7 +1118,7 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 
@@ -1126,7 +1130,7 @@ def _load_base_checkpoint(
                 'megatron.legacy.fp16_deprecated.loss_scaler'
             ]
             sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
             sys.modules.pop('megatron.model', None)
@@ -1619,6 +1623,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 assert not is_torch_dist
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
                 iteration, release = read_metadata(tracker_filename)
+
+                before_iteration = iteration
+                try:
+                    iteration = state_dict['iteration']
+                except KeyError:
+                    try:  # Backward compatible with older checkpoints
+                        iteration = state_dict['total_iters']
+                    except KeyError:
+                        print_rank_0('A metadata file exists but unable to load '
+                                    'iteration from checkpoint {}, exiting'.format(checkpoint_name))
+                        sys.exit()
+                if before_iteration != iteration:
+                    logger.warning(f"load_checkpoint: iteration is changed from {before_iteration} to {iteration} for skipping iteration(optimizer.if_skip is True)")
+
+                if release:
+                    assert before_iteration == iteration, "release is True, but iteration is changed from {before_iteration} to {iteration} for skipping iteration(optimizer.if_skip is True)"
+                
                 model_checkpoint_name = \
                     get_checkpoint_name(load_dir, iteration, release)
                 optim_checkpoint_name = \
@@ -1765,7 +1786,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
+    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     ret_state_dict = state_dict['model']
 
     if only_query_model:
