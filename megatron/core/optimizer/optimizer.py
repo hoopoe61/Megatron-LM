@@ -1100,6 +1100,15 @@ class ChainedOptimizer(MegatronOptimizer):
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
 
+        import os
+        self.skip_grad_norm_threshold = float(os.getenv("skip_grad_norm_threshold", "1.0e6"))
+        self.skip_grad_norm_restart_times = int(os.getenv("skip_grad_norm_restart_times", "4"))
+        self.auto_skip_interval = int(os.getenv("auto_skip_interval", "20"))
+        self.auto_skip_threshold = int(os.getenv("auto_skip_threshold", "1"))
+        self.skip_grad_norm_restart_count = 0
+        self.if_skip = False
+        self.first_skip_step = -1
+
     @property
     def optimizer(self):
         """
@@ -1237,6 +1246,11 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
+
+        # 如果需要跳过，那么将grad设置为0，更新相当于没有更新
+        if self.if_skip:
+            self.optimizer.zero_grad()
+        
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             success &= optimizer.step_with_ready_grads()
@@ -1309,6 +1323,86 @@ class ChainedOptimizer(MegatronOptimizer):
 
         grad_norm = self.get_grad_norm()
 
+        if grad_norm > self.skip_grad_norm_threshold:
+            from megatron.training import get_args
+
+            self.skip_grad_norm_restart_count += 1
+            if self.skip_grad_norm_restart_count > self.skip_grad_norm_restart_times:
+                import os
+                import json
+                from megatron.training.training import ArsenalReTrainError
+
+                auto_skip_file = os.getenv("auto_skip_file", './auto_skip_steps_record.json')
+                
+                if torch.distributed.get_rank() == 0:
+                    #读取文件
+                    skip_steps = {}
+                    if os.path.exists(auto_skip_file):
+                        with open(auto_skip_file, 'r') as f:
+                            config = f.read().strip()
+                            if len(config) > 0:
+                                skip_steps = json.loads(config)
+                    
+                    current_skip_step = self.first_skip_step
+                    current_skip_step_str = str(current_skip_step)
+
+                    with open(auto_skip_file, 'w+') as f:
+                        if current_skip_step_str in skip_steps.keys():
+                            skip_steps[current_skip_step_str] = str(int(skip_steps[current_skip_step_str]) + 1)
+                        else:
+                            skip_steps[current_skip_step_str] = str(1)
+                        json.dump(skip_steps, f)
+                    
+                    # 根据跳转以后的值，计算出来left_step，在blend dataset中需要使用相同的算法
+                    # 最小的训练step就是0
+                    left_step = max(current_skip_step - (self.auto_skip_interval * int(skip_steps[current_skip_step_str]))/2, 0)
+
+                    args = get_args()
+                    # 在args.load中寻找最新的一个ckpt，ckpt的格式是：iter_0000000
+                    ckpt_load_dir = args.load
+                    all_ckpt_steps = []
+
+                    if os.path.isdir(ckpt_load_dir):
+                        # 遍历ckpt_load_dir中以iter_开头的dir
+                        for iter_dir in os.listdir(ckpt_load_dir):
+                            if iter_dir.startswith('iter_') and os.path.isdir(os.path.join(ckpt_load_dir, iter_dir)):
+                                iter_step = int(iter_dir.split('_')[-1])
+                                all_ckpt_steps.append(iter_step)
+                    # 按照从大到小排序
+                    all_ckpt_steps.sort(reverse=True)
+
+                    # 在all_ckpt_steps中找到第一个小于left_step的值
+                    current_retrain_step = 0
+                    for ckpt_step in all_ckpt_steps:
+                        if ckpt_step < left_step:
+                            current_retrain_step = ckpt_step
+                            break
+                    
+                    # 将latest_ckpt_step的值覆盖写到ckpt_dir的arsenal_retrain_step.txt中
+                    last_retrain_step = 0
+                    arsenal_retrain_file = os.path.join(ckpt_load_dir, 'arsenal_retrain_step.txt')
+                    if os.path.exists(arsenal_retrain_file):
+                        with open(arsenal_retrain_file, 'r') as f:
+                            tmp_step = f.read().strip()
+                            if tmp_step != '':
+                                last_retrain_step = int(tmp_step)
+                    with open(arsenal_retrain_file, 'w') as f:
+                        f.write(str(current_retrain_step))
+                        logger.warning(f"arsenal retrain - last retrain step: {last_retrain_step}, now is changed to: {current_retrain_step}")
+                
+                # 不同rank同步等待，避免写出失败
+                torch.distributed.barrier()
+                raise ArsenalReTrainError(f"grad norm: {grad_norm} is bigger than {self.skip_grad_norm_threshold} for {self.skip_grad_norm_restart_count}(>{self.skip_grad_norm_restart_times}) times, will retrain")
+            
+            self.if_skip = True
+            if self.first_skip_step < 0:
+                args = get_args()
+                self.first_skip_step = args.curr_iteration
+        else:
+            self.skip_grad_norm_restart_count = 0
+            self.if_skip = False
+            self.first_skip_step = -1
+
         # Clip gradients.
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
@@ -1330,6 +1424,9 @@ class ChainedOptimizer(MegatronOptimizer):
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
         update_successful = self.step_with_ready_grads()
+
+        if self.if_skip:
+            update_successful = False
 
         return update_successful, grad_norm, num_zeros_in_grad
 
