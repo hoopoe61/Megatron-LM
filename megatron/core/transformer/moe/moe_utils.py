@@ -710,6 +710,8 @@ def topk_routing_with_score_function(
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            # 跟HF 和 VLLM中的逻辑保持一致，进行归一化处理
+            probs = probs / (probs.sum(dim=-1, keepdim=True)) if topk > 1 else probs
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)

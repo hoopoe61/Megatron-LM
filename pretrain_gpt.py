@@ -344,6 +344,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
+    assert args.moe_router_fusion == False, f"current {args.moe_router_fusion} is not supported for custom moe topk"
 
     config = core_gpt_dataset_config_from_args(args)
 

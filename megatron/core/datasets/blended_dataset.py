@@ -3,10 +3,12 @@
 import hashlib
 import json
 import logging
+from math import floor
 import os
 import time
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Union
+import copy
 
 import numpy
 import torch
@@ -84,6 +86,79 @@ class BlendedDataset(torch.utils.data.Dataset):
         ).hexdigest()
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
+        
+        self.set_skip_config()
+    
+    def set_skip_config(self):
+        from megatron.training import get_args
+        args = get_args()
+        #读取文件 和 env相关的配置，得到skip的数据；
+        self.arsenal_skip_config = None
+        # 读取auto_skip_steps_record.json中的文件
+        skip_steps = {}
+        auto_skip_file = os.getenv("auto_skip_file", './auto_skip_steps_record.json')
+        skip_recoder = os.path.join(os.path.dirname(auto_skip_file), "do_not_delete_" + os.path.basename(auto_skip_file))
+        auto_skip_interval = int(os.getenv("auto_skip_interval", "20"))
+        auto_skip_threshold = int(os.getenv("auto_skip_threshold", "1"))
+        manual_skip_config = os.getenv("manual_skip_config", "{}")
+        max_skip_step = int(os.getenv("max_skip_step", "200"))
+
+        if os.path.exists(auto_skip_file):
+            with open(auto_skip_file, 'r') as f:
+                config = f.read().strip()
+                if len(config) > 0:
+                    skip_steps = json.loads(config)
+            # 这里不能做同步，因为不是所有的rank都会进入到这个blenddataset的构建过程中
+            #torch.distributed.barrier()
+        save_interval = args.save_interval
+        next_ckpt_step = None
+        if save_interval and save_interval > 0:
+            next_ckpt_step = int((floor((args.iteration+1)/save_interval)+1) * save_interval)
+        
+        adapted_skip_steps = {}
+        for step, count in skip_steps.items():
+            step = int(step)
+            count = int(count)
+            if count >= auto_skip_threshold:
+                interval = min(auto_skip_interval * (count-auto_skip_threshold+1), max_skip_step)
+                left_step = max(step - interval/2, 0)
+                adapted_skip_steps[left_step] = interval
+
+        if len(adapted_skip_steps) > 0:
+            log_single_rank(logger, logging.INFO, f"arsenal retrain - set auto skip config: {adapted_skip_steps}, next_ckpt_step: {next_ckpt_step}")
+        else:
+            log_single_rank(logger, logging.INFO, f"arsenal retrain - no auto skip config.")
+        self.arsenal_skip_config = adapted_skip_steps
+        
+        manual_skip_config = manual_skip_config.strip()
+        if len(manual_skip_config) > 0:
+            manual_skip_config = json.loads(manual_skip_config)
+        else:
+            manual_skip_config = {}
+        
+        if len(manual_skip_config) > 0:
+            log_single_rank(logger, logging.INFO, f"arsenal retrain - use manual skip config: {manual_skip_config}")
+        else:
+            log_single_rank(logger, logging.INFO, f"arsenal retrain - no manual skip config.")
+
+        for step, interval in manual_skip_config.items():
+            step = int(step)
+            interval = int(interval)
+            self.arsenal_skip_config[step] = interval
+
+        self.gbs = int(args.global_batch_size)
+
+        if torch.distributed.get_rank() == 0:
+            with open(skip_recoder, "w+") as f:
+                json.dump(self.arsenal_skip_config, f)
+        
+        if len(self.arsenal_skip_config) > 0:
+            # 这里不能做同步，因为不是所有的rank都会进入到这个blenddataset的构建过程中
+            # torch.distributed.barrier()
+            # 所有rank都打印，方便对比不同rank上的差异
+            logger.info(f"arsenal retrain - use auto skip config: {skip_steps} in {auto_skip_file}")
+            logger.info(f"arsenal retrain - use skip gbs: {self.gbs}, final skip config: {self.arsenal_skip_config}")
+
 
     def __len__(self) -> int:
         if self.config.defer_npy_index_mmap:
@@ -102,6 +177,12 @@ class BlendedDataset(torch.utils.data.Dataset):
             self.dataset_sample_index = numpy.load(
                 self.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
             )
+        if self.arsenal_skip_config:
+            tmp_idx = idx
+            for start_step, skip_steps in self.arsenal_skip_config.items():
+                if tmp_idx >= (int(start_step)-1)*self.gbs:
+                    idx = idx + int(skip_steps)*self.gbs
+            assert 0 <= idx < self.dataset_index.shape[0], f"idx: {idx} is out of range, dataset length: {self.dataset_index.shape[0]}"
 
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]

@@ -197,6 +197,12 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+global train_ds
+global valid_ds
+global test_ds
+
+class ArsenalReTrainError(Exception):
+    """Raised when re-train is needed."""
 
 def destroy_global_state():
     destroy_global_vars()
@@ -897,110 +903,132 @@ def pretrain(
         }
     else:
         checkpointing_context = {}
+    
+    global train_ds, valid_ds, test_ds
+    train_ds = valid_ds = test_ds = None
 
-    # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
-    )
-
-    timers('model-and-optimizer-setup').stop()
-    print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    config = get_model_config(model[0])
-
-    # Build a separate inference model for RL if requested.
-    inference_model = None
-    if args.perform_rl_step:
-        if (
-            args.rl_inference_tensor_model_parallel_size is not None
-            or args.rl_inference_pipeline_model_parallel_size is not None
-            or args.rl_inference_expert_model_parallel_size is not None
-            or args.rl_inference_expert_tensor_model_parallel_size is not None
-        ):
-            print_rank_0(
-                "Building separate RL inference model with custom parallelism: "
-                f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
-                f"EP={args.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
-            )
-            inference_pg_collection = build_inference_pg_collection(
-                args.world_size,
-                tp_size=args.rl_inference_tensor_model_parallel_size,
-                pp_size=args.rl_inference_pipeline_model_parallel_size,
-                ep_size=args.rl_inference_expert_model_parallel_size,
-                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
-            )
-
-            # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(config)
-            if args.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
-            if args.rl_inference_pipeline_model_parallel_size is not None:
-                inference_config.pipeline_model_parallel_size = (
-                    args.rl_inference_pipeline_model_parallel_size
-                )
-            if args.rl_inference_expert_model_parallel_size is not None:
-                inference_config.expert_model_parallel_size = (
-                    args.rl_inference_expert_model_parallel_size
-                )
-            if args.rl_inference_expert_tensor_model_parallel_size is not None:
-                inference_config.expert_tensor_parallel_size = (
-                    args.rl_inference_expert_tensor_model_parallel_size
-                )
-
-            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
-            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
-            uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
-            if uvm_level and uvm_level > 0:
-                uvm_mempool = create_unified_mempool()
-
-            mempool_ctx = (
-                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
-            )
-            with mempool_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
-                    pg_collection=inference_pg_collection,
-                    config=inference_config,
-                )
-            inference_model[0].eval()
-
-
-
-    # Data stuff.
-    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-            assert "vp_stage" in dataset_provider_parameters, \
-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = \
-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
-            )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+    def init_model_optimizer_data():
+        # Model, optimizer, and learning rate.
+        timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context
         )
-    timers('train/valid/test-data-iterators-setup').stop()
-    print_datetime('after dataloaders are built')
-    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
+        timers('model-and-optimizer-setup').stop()
+        print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+        config = get_model_config(model[0])
+
+        # Build a separate inference model for RL if requested.
+        inference_model = None
+        if args.perform_rl_step:
+            if (
+                args.rl_inference_tensor_model_parallel_size is not None
+                or args.rl_inference_pipeline_model_parallel_size is not None
+                or args.rl_inference_expert_model_parallel_size is not None
+                or args.rl_inference_expert_tensor_model_parallel_size is not None
+            ):
+                print_rank_0(
+                    "Building separate RL inference model with custom parallelism: "
+                    f"TP={args.rl_inference_tensor_model_parallel_size}, "
+                    f"PP={args.rl_inference_pipeline_model_parallel_size}, "
+                    f"EP={args.rl_inference_expert_model_parallel_size}, "
+                    f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
+                )
+                inference_pg_collection = build_inference_pg_collection(
+                    args.world_size,
+                    tp_size=args.rl_inference_tensor_model_parallel_size,
+                    pp_size=args.rl_inference_pipeline_model_parallel_size,
+                    ep_size=args.rl_inference_expert_model_parallel_size,
+                    expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
+                    use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+                )
+
+                # Build an isolated inference config so training config remains unchanged
+                inference_config = copy.deepcopy(config)
+                if args.rl_inference_tensor_model_parallel_size is not None:
+                    inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
+                if args.rl_inference_pipeline_model_parallel_size is not None:
+                    inference_config.pipeline_model_parallel_size = (
+                        args.rl_inference_pipeline_model_parallel_size
+                    )
+                if args.rl_inference_expert_model_parallel_size is not None:
+                    inference_config.expert_model_parallel_size = (
+                        args.rl_inference_expert_model_parallel_size
+                    )
+                if args.rl_inference_expert_tensor_model_parallel_size is not None:
+                    inference_config.expert_tensor_parallel_size = (
+                        args.rl_inference_expert_tensor_model_parallel_size
+                    )
+
+                # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
+                # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+                uvm_mempool = None
+                uvm_level = args.rl_inference_model_unified_memory_level
+                if uvm_level and uvm_level > 0:
+                    uvm_mempool = create_unified_mempool()
+
+                mempool_ctx = (
+                    torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+                )
+                with mempool_ctx:
+                    inference_model = get_model(
+                        model_provider,
+                        model_type,
+                        wrap_with_ddp=False,
+                        pg_collection=inference_pg_collection,
+                        config=inference_config,
+                    )
+                inference_model[0].eval()
+
+
+
+        # Data stuff.
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for vp_stage in range(len(model)):
+                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                assert "vp_stage" in dataset_provider_parameters, \
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                vp_stage_train_valid_test_dataset_provider = \
+                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                iterators = build_train_valid_test_data_iterators(
+                    vp_stage_train_valid_test_dataset_provider
+                )
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator = (
+                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            )
+        timers('train/valid/test-data-iterators-setup').stop()
+        print_datetime('after dataloaders are built')
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        return (
+            model,
+            optimizer,
+            opt_param_scheduler,
+            config,
+            train_data_iterator,
+            valid_data_iterator,
+            test_data_iterator,
+        )
+
+    (
+        model,
+        optimizer,
+        opt_param_scheduler,
+        config,
+        train_data_iterator,
+        valid_data_iterator,
+        test_data_iterator,
+    ) = init_model_optimizer_data()
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
         args.train_iters,
@@ -1026,21 +1054,74 @@ def pretrain(
     if not args.skip_train:
         print_rank_0('training ...')
 
-        iteration = 0
-        if args.do_train and args.train_iters > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                config,
-                checkpointing_context,
-                non_loss_data_func,
-                inference_model,
-            )
+        while True:
+            iteration = 0
+            try:
+                if args.do_train and args.train_iters > 0:
+                    iteration, num_floating_point_operations_so_far = train( #整个train的逻辑保持不变，raise error了以后，再拉起一次续训；
+                        forward_step_func,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        train_data_iterator,
+                        valid_data_iterator,
+                        process_non_loss_data_func,
+                        config,
+                        checkpointing_context,
+                        non_loss_data_func,
+                        inference_model,
+                    )
+            except Exception as e:
+                if isinstance(e, ArsenalReTrainError):
+                    print_rank_0(f"arsenal retrain - {e}")
+                    # 从args.load中读取arsenal_retrain_step.txt的值，并赋值给args.ckpt_step
+                    arsenal_retrain_file = os.path.join(args.load, 'arsenal_retrain_step.txt')
+                    args.ckpt_step = int(open(arsenal_retrain_file, 'r').read().strip())
+                    assert args.ckpt_step > 0, f"arsenal retrain - ckpt_step:{args.ckpt_step} is not valid, please check the file: {arsenal_retrain_file}"
+                    print_rank_0(f"arsenal retrain - to use ckpt_step: {args.ckpt_step} to retrain")
+                    
+                    # 重新创建dataloader相关的进程之前，把原来创建的dataloader相关的进程销毁掉
+                    destroy_train_valid_test_data_loaders_and_iterators(
+                        train_data_iterator=train_data_iterator,
+                        valid_data_iterator=valid_data_iterator,
+                        test_data_iterator=test_data_iterator,
+                    )
+
+                    # 释放model, optimizer, opt_param_scheduler, config的占用的显存和内存资源
+                    del model
+                    del optimizer
+                    del opt_param_scheduler
+                    del config
+                    del train_data_iterator
+                    del valid_data_iterator
+                    del test_data_iterator
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    (
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        config,
+                        train_data_iterator,
+                        valid_data_iterator,
+                        test_data_iterator,
+                    ) = init_model_optimizer_data()
+
+                    # 触发Dataset中对skip config的更新
+                    # 注意：train_data_iterator 在非 TP-rank-0 的 rank 上为 None，
+                    # 不通过 train_data_iterator.iterable._dataset 访问, 直接使用全局缓存的 train_ds（BlendedDataset 实例）。
+                    if train_ds is not None and hasattr(train_ds, 'set_skip_config'):
+                        train_ds.set_skip_config()
+
+                    # 处理完成以后，触发快恢：再次拉起train的逻辑
+                    continue
+                else:
+                    print_rank_0(f"Error in training: {e}")
+                    raise e
+            else:
+                print_rank_0(f"train() finished, exit training...")
+                break
 
         print_datetime('after training is done')
 
@@ -1698,18 +1779,23 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
-
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-    # get max attention logit for logging and run clip_qk()
-    # Part of MuonClip Optimizer step
-    log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
-
+    try:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        
+        # get max attention logit for logging and run clip_qk()
+        # Part of MuonClip Optimizer step
+        log_max_attention_logit = 0
+        if args.qk_clip or args.log_max_attention_logit:
+            log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+    except Exception as e:
+        if isinstance(e, ArsenalReTrainError):
+            timers('optimizer').stop()
+            # Empty unused memory.
+            if args.empty_unused_memory_level >= 1:
+                torch.cuda.empty_cache()
+        raise e
     timers('optimizer').stop()
-
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful)
@@ -2081,6 +2167,8 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+        if_skip = grad_norm > float(os.getenv("skip_grad_norm_threshold", "1.0e6"))
+        log_string += f' if_skip: {if_skip} |'
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -2573,6 +2661,7 @@ def train(
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
+    arsenal_retrain = False
     exit_code = 0
     is_first_iteration = True
 
@@ -2783,18 +2872,28 @@ def train(
                 buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
-        (
-            loss_dict,
-            skipped_iter,
-            should_checkpoint,
-            should_exit,
-            exit_code,
-            grad_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-        ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-        )
+        arsenal_exception = None
+        try:
+            (
+                loss_dict,
+                skipped_iter,
+                should_checkpoint,
+                should_exit,
+                exit_code,
+                grad_norm,
+                num_zeros_in_grad,
+                max_attention_logit,
+            ) = train_step(
+                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+            )
+        except Exception as e:
+            ft_integration.on_training_step_end()
+            if isinstance(e, ArsenalReTrainError):
+                arsenal_retrain = True
+                arsenal_exception = e
+                break
+            else:
+                raise e
         ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(
@@ -3028,6 +3127,15 @@ def train(
         if getattr(args, 'perform_rl_step', False):
             rl_utils.rl_inference_interface_shutdown()
         sys.exit(exit_code)
+
+    if arsenal_retrain:
+        wandb_writer = get_wandb_writer()
+        if wandb_writer:
+            wandb_writer.finish()
+        ft_integration.shutdown()
+        one_logger_utils.finish()
+        timers('interval-time').stop()
+        raise arsenal_exception
 
     return iteration, num_floating_point_operations_so_far
 
@@ -3287,6 +3395,30 @@ def cyclic_iter(iter):
             yield x
 
 
+def destroy_data_iterator(data_iterator) -> None:
+    """Destroy a (possibly wrapped) data iterator and attempt to stop its worker processes."""
+    if data_iterator is None:
+        return
+    # Multiple validation sets may pass a list of iterators.
+    if isinstance(data_iterator, list):
+        for it in data_iterator:
+            destroy_data_iterator(it)
+        return
+    # 触发调用torch中的__del__，执行_shutdown_workers
+    del data_iterator.iterable
+
+
+def destroy_train_valid_test_data_loaders_and_iterators(
+    train_data_iterator=None, valid_data_iterator=None, test_data_iterator=None
+) -> None:
+    """Shutdown dataloader workers (best-effort) and drop references so GC can reclaim."""
+    destroy_data_iterator(train_data_iterator)
+    destroy_data_iterator(valid_data_iterator)
+    destroy_data_iterator(test_data_iterator)
+
+    gc.collect()
+
+
 def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
@@ -3379,11 +3511,18 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
-            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            global train_ds, valid_ds, test_ds
+
+            # 如果之前已经build过，那么不再重新build，节省时间
+            if train_ds is None and valid_ds is None and test_ds is None:
+                train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+                valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+
             if args.skip_train:
                 train_dataloader = None
             else:
+                # Build dataloders.
+                # 必须重新build，因为args.consumed_train_samples有可能发生变化
                 train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
             valid_dataloaders = []
             for valid_d in valid_ds:
