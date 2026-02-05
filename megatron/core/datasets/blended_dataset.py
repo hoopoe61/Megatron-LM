@@ -8,6 +8,7 @@ import os
 import time
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Union
+import copy
 
 import numpy
 import torch
@@ -107,6 +108,8 @@ class BlendedDataset(torch.utils.data.Dataset):
                 config = f.read().strip()
                 if len(config) > 0:
                     skip_steps = json.loads(config)
+            # 读文件上的同步，如果有rank没有读到文件，那么就会barrier()超时     
+            torch.distributed.barrier()
         
         save_interval = args.save_interval
         next_ckpt_step = None
@@ -114,6 +117,8 @@ class BlendedDataset(torch.utils.data.Dataset):
             next_ckpt_step = int((floor((args.iteration+1)/save_interval)+1) * save_interval)
         
         adapted_skip_steps = {}
+        # keep_steps_config: 记录了需要保留的step和count，用于后续更新到文件中
+        kept_steps_config = copy.deepcopy(skip_steps)
         ignore_steps = {}
         for step, count in skip_steps.items():
             step = int(step)
@@ -123,6 +128,7 @@ class BlendedDataset(torch.utils.data.Dataset):
                 left_step = max(step - interval/2, 0)
                 if next_ckpt_step and left_step >= next_ckpt_step:
                     ignore_steps[(step, count, left_step)] = interval
+                    del kept_steps_config[str(step)]
                     continue
                 adapted_skip_steps[left_step] = interval
         
@@ -152,15 +158,20 @@ class BlendedDataset(torch.utils.data.Dataset):
             interval = int(interval)
             self.arsenal_skip_config[step] = interval
 
-        if len(self.arsenal_skip_config) > 0:
-            self.gbs = int(args.global_batch_size)
+        self.gbs = int(args.global_batch_size)
 
-            if torch.distributed.get_rank() == 0:
-                with open(skip_recoder, "w+") as f:
-                    json.dump(self.arsenal_skip_config, f)
-            
+        if torch.distributed.get_rank() == 0:
+            with open(skip_recoder, "w+") as f:
+                json.dump(self.arsenal_skip_config, f)
+            with open(auto_skip_file, 'w+') as f:
+                json.dump(kept_steps_config, f)
+        
+        if len(self.arsenal_skip_config) > 0:
+            # 放在if里面，避免出现不同rank对self.arsenal_skip_config判断不一致的问题，如果不一致那么就会barrier()超时
             torch.distributed.barrier()
-            log_single_rank(logger, logging.INFO, f"arsenal retrain - use skip gbs: {self.gbs}, final skip config: {self.arsenal_skip_config}")
+            # 所有rank都打印，方便对比不同rank上的差异
+            logger.info(f"arsenal retrain - kept auto skip config: {kept_steps_config}, saved to {auto_skip_file}")
+            logger.info(f"arsenal retrain - use skip gbs: {self.gbs}, final skip config: {self.arsenal_skip_config}")
 
 
     def __len__(self) -> int:
