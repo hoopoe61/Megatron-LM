@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from math import floor
 import logging
 
 import torch
@@ -1111,8 +1110,6 @@ class ChainedOptimizer(MegatronOptimizer):
         self.if_skip = False
         self.first_skip_step = -1
 
-        self.counter_for_test = 0
-
     @property
     def optimizer(self):
         """
@@ -1326,13 +1323,11 @@ class ChainedOptimizer(MegatronOptimizer):
 
         grad_norm = self.get_grad_norm()
 
-        self.counter_for_test += 1
-        if grad_norm > self.skip_grad_norm_threshold or self.counter_for_test > 3:
+        if grad_norm > self.skip_grad_norm_threshold:
             from megatron.training import get_args
 
             self.skip_grad_norm_restart_count += 1
             if self.skip_grad_norm_restart_count > self.skip_grad_norm_restart_times:
-                print(f"self.skip_grad_norm_restart_count: {self.skip_grad_norm_restart_count}")
                 import os
                 import json
                 from megatron.training.training import ArsenalReTrainError
