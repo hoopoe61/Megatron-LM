@@ -805,7 +805,10 @@ def pretrain(
                     ) = init_model_optimizer_data()
 
                     # 触发Dataset中对skip config的更新
-                    train_data_iterator.iterable._dataset.set_skip_config()
+                    # 注意：train_data_iterator 在非 TP-rank-0 的 rank 上为 None，
+                    # 不通过 train_data_iterator.iterable._dataset 访问, 直接使用全局缓存的 train_ds（BlendedDataset 实例）。
+                    if train_ds is not None and hasattr(train_ds, 'set_skip_config'):
+                        train_ds.set_skip_config()
 
                     # 处理完成以后，触发快恢：再次拉起train的逻辑
                     continue
