@@ -108,7 +108,7 @@ class BlendedDataset(torch.utils.data.Dataset):
                 config = f.read().strip()
                 if len(config) > 0:
                     skip_steps = json.loads(config)
-            # 读文件上的同步，如果有rank没有读到文件，那么就会barrier()超时     
+            # 这里不能做同步，因为不是所有的rank都会进入到这个blenddataset的构建过程中
             #torch.distributed.barrier()
         save_interval = args.save_interval
         next_ckpt_step = None
@@ -153,8 +153,8 @@ class BlendedDataset(torch.utils.data.Dataset):
                 json.dump(self.arsenal_skip_config, f)
         
         if len(self.arsenal_skip_config) > 0:
-            # 放在if里面，避免出现不同rank对self.arsenal_skip_config判断不一致的问题，如果不一致那么就会barrier()超时
-            #torch.distributed.barrier()
+            # 这里不能做同步，因为不是所有的rank都会进入到这个blenddataset的构建过程中
+            # torch.distributed.barrier()
             # 所有rank都打印，方便对比不同rank上的差异
             logger.info(f"arsenal retrain - use auto skip config: {skip_steps} in {auto_skip_file}")
             logger.info(f"arsenal retrain - use skip gbs: {self.gbs}, final skip config: {self.arsenal_skip_config}")
@@ -169,6 +169,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             for start_step, skip_steps in self.arsenal_skip_config.items():
                 if tmp_idx >= (int(start_step)-1)*self.gbs:
                     idx = idx + int(skip_steps)*self.gbs
+            assert 0 <= idx < self.dataset_index.shape[0], f"idx: {idx} is out of range, dataset length: {self.dataset_index.shape[0]}"
 
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
