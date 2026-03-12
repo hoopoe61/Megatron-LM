@@ -116,8 +116,6 @@ try:
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
-from megatron.training import get_args
-
 class LinearQkv(Protocol):
     """Protocol for linear_qkv modules."""
 
@@ -264,6 +262,7 @@ class Attention(MegatronModule, ABC):
 
         assert self.config.kv_channels is not None
         assert self.config.num_query_groups is not None
+        from megatron.training import get_args
         args = get_args()
         self.reset_attention_mask = args.reset_attention_mask
         self.reset_position_ids = args.reset_position_ids

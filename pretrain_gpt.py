@@ -262,12 +262,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
-    return mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
+    '''
     #return (
     #    is_first_or_last_pipeline_stage(vp_stage)
     #    or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     #) and parallel_state.get_tensor_model_parallel_rank() == 0
+    '''
 
+    return parallel_state.get_tensor_model_parallel_rank() == 0
 
 def core_gpt_dataset_config_from_args(args):
     if args.legacy_tokenizer:

@@ -1018,6 +1018,7 @@ def pretrain(
             train_data_iterator,
             valid_data_iterator,
             test_data_iterator,
+            inference_model,
         )
 
     (
@@ -1028,6 +1029,7 @@ def pretrain(
         train_data_iterator,
         valid_data_iterator,
         test_data_iterator,
+        inference_model,
     ) = init_model_optimizer_data()
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
@@ -1106,6 +1108,7 @@ def pretrain(
                         train_data_iterator,
                         valid_data_iterator,
                         test_data_iterator,
+                        inference_model,
                     ) = init_model_optimizer_data()
 
                     # 触发Dataset中对skip config的更新
