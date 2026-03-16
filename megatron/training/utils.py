@@ -500,7 +500,7 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator):
+def get_batch_on_this_tp_rank(data_iterator, has_data_iterator):
 
     args = get_args()
 
@@ -512,7 +512,7 @@ def get_batch_on_this_tp_rank(data_iterator):
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    if has_data_iterator and mpu.get_tensor_model_parallel_rank() == 0:
 
         assert data_iterator is not None
         data = next(data_iterator)

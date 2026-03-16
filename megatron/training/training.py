@@ -139,9 +139,7 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
-global train_ds
-global valid_ds
-global test_ds
+global train_ds_dict, train_ds, valid_ds_dict, valid_ds, test_ds_dict, test_ds
 
 class ArsenalReTrainError(Exception):
     """Raised when re-train is needed."""
@@ -667,8 +665,13 @@ def pretrain(
     else:
         checkpointing_context = {}
     
-    global train_ds, valid_ds, test_ds
-    train_ds = valid_ds = test_ds = None
+    global train_ds_dict, train_ds, valid_ds_dict, valid_ds, test_ds_dict, test_ds
+    train_ds_dict = {} 
+    valid_ds_dict = {} 
+    test_ds_dict = {}
+    train_ds = None
+    valid_ds = None
+    test_ds = None
 
     def init_model_optimizer_data():
         # Model, optimizer, and learning rate.
@@ -2946,13 +2949,37 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        global train_ds, valid_ds, test_ds
+        global train_ds_dict, train_ds, valid_ds_dict, valid_ds, test_ds_dict, test_ds
+
+        vp_stage = -1
+        if isinstance(build_train_valid_test_datasets_provider, functools.partial):
+            vp_stage = build_train_valid_test_datasets_provider.keywords.get("vp_stage")
+        
+        if vp_stage not in train_ds_dict:
+            train_ds = None
+        else:
+            train_ds = train_ds_dict[vp_stage]
+        
+        if vp_stage not in valid_ds_dict:
+            valid_ds = None
+        else:
+            valid_ds = valid_ds_dict[vp_stage]
+        
+        if vp_stage not in test_ds_dict:
+            test_ds = None
+        else:
+            test_ds = test_ds_dict[vp_stage]
+        
         # 如果之前已经build过，那么不再重新build，节省时间
         if train_ds is None and valid_ds is None and test_ds is None:
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
                 build_train_valid_test_datasets_provider, (1, 1, 1) if getattr(args, 'perform_rl_step', False) else None
             )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        
+            train_ds_dict[vp_stage] = train_ds
+            valid_ds_dict[vp_stage] = valid_ds
+            test_ds_dict[vp_stage] = test_ds
         
         # Build dataloders.
         # 必须重新build，因为args.consumed_train_samples有可能发生变化

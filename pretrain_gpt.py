@@ -46,7 +46,7 @@ def get_batch(data_iterator, vp_stage=None, reset_attention_mask=False):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+    batch = get_batch_on_this_tp_rank(data_iterator, is_first_or_last_pipeline_stage(vp_stage))
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -219,8 +219,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None):
-    return parallel_state.get_tensor_model_parallel_rank() == 0
-    #return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
+    return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
