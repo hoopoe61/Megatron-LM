@@ -52,8 +52,11 @@ def get_batch(data_iterator, vp_stage=None, reset_attention_mask=False):
     batch = get_batch_on_this_cp_rank(batch)
 
     if reset_attention_mask and not is_first_or_last_pipeline_stage(vp_stage):
-        assert "attention_mask" in batch.keys()
-        return None, None, None, batch["attention_mask"], None
+        assert "position_ids" in batch.keys() or "attention_mask" in batch.keys()
+        if "position_ids" in batch.keys():
+            return None, None, None, None, batch["position_ids"]
+        else:
+            return None, None, None, batch["attention_mask"], None
 
     return batch.values()
 
@@ -147,6 +150,25 @@ def mask_to_seq_lens(mask_2d: torch.Tensor):
 
     return seq_lens
 
+def pos_ids_to_seq_lens(position_ids: torch.Tensor):
+    """
+    position_ids: [S] 单条样本的位置 ID (例如 [0,1,2,0,1])
+    return: 1D tensor of seq_lens (例如 [3, 2])
+    """
+    seq_length = position_ids.size(0)
+    # 找到所有新文档开始的位置 (position_id == 0)
+    zero_indices = torch.where(position_ids == 0)[0]
+    
+    # 计算两个 0 之间的间距
+    # 例如 zero_indices = [0, 512], seq_length = 1024 -> [512, 512]
+    if len(zero_indices) > 1:
+        # 将末尾边界加入计算
+        end_boundary = torch.tensor([seq_length], device=position_ids.device)
+        seq_lens = torch.diff(torch.cat([zero_indices, end_boundary]))
+    else:
+        seq_lens = torch.tensor([seq_length], device=position_ids.device)
+    return seq_lens
+
 def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -172,10 +194,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         # attention_mask: [B, 1, S, S]; mask_to_seq_lens 输出当前 batch 每条样本的长度
         assert args.create_attention_mask_in_dataloader and attention_mask is not None, "attention_mask must be created in dataloader when reset_attention_mask is enabled"
         all_seq_lens = []
-        for i in range(attention_mask.size(0)):
-            seq_lens_b = mask_to_seq_lens(attention_mask[i].squeeze(0))
-            all_seq_lens.append(seq_lens_b)
+        if position_ids is not None:
+            for i in range(position_ids.size(0)):
+                # 直接通过 position_ids 还原该样本的文档长度分布
+                seq_lens_b = pos_ids_to_seq_lens(position_ids[i])
+                all_seq_lens.append(seq_lens_b)
+        else:
+            for i in range(attention_mask.size(0)):
+                # 通过 attention_mask 还原该样本的文档长度分布
+                seq_lens_b = mask_to_seq_lens(attention_mask[i, 0])
+                all_seq_lens.append(seq_lens_b)
         all_seq_lens = torch.cat(all_seq_lens, dim=0)
+
+        #if position_ids is not None and not is_first_or_last_pipeline_stage(vp_stage):
+        #    position_ids = None
 
         cu_seqlens = torch.empty(
             all_seq_lens.numel() + 1, dtype=torch.int32, device=attention_mask.device
@@ -188,6 +220,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         else:
             # 如果没有使用reset_position_ids，则max_seqlens为实际的seq length
             max_seqlens = int(attention_mask.size(2))
+            if position_ids is not None:
+                batch_size = int(position_ids.size(0))
+                position_ids = torch.arange(max_seqlens,dtype=torch.long,device=position_ids.device,).unsqueeze(0).expand(batch_size, max_seqlens).contiguous()
 
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
