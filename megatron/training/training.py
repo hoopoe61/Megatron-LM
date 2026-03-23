@@ -767,6 +767,7 @@ def pretrain(
 
         while True:
             iteration = 0
+            arsenal_retrain = False
             try:
                 if args.do_train and args.train_iters > 0:
                     iteration, num_floating_point_operations_so_far = train( #整个train的逻辑保持不变，raise error了以后，再拉起一次续训；
@@ -789,49 +790,48 @@ def pretrain(
                     args.ckpt_step = int(open(arsenal_retrain_file, 'r').read().strip())
                     assert args.ckpt_step > 0, f"arsenal retrain - ckpt_step:{args.ckpt_step} is not valid, please check the file: {arsenal_retrain_file}"
                     print_rank_0(f"arsenal retrain - to use ckpt_step: {args.ckpt_step} to retrain")
-                    
-                    # 重新创建dataloader相关的进程之前，把原来创建的dataloader相关的进程销毁掉
-                    destroy_train_valid_test_data_loaders_and_iterators(
-                        train_data_iterator=train_data_iterator,
-                        valid_data_iterator=valid_data_iterator,
-                        test_data_iterator=test_data_iterator,
-                    )
-
-                    # 释放model, optimizer, opt_param_scheduler, config的占用的显存和内存资源
-                    del model
-                    del optimizer
-                    del opt_param_scheduler
-                    del config
-                    del train_data_iterator
-                    del valid_data_iterator
-                    del test_data_iterator
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                    (
-                        model,
-                        optimizer,
-                        opt_param_scheduler,
-                        config,
-                        train_data_iterator,
-                        valid_data_iterator,
-                        test_data_iterator,
-                    ) = init_model_optimizer_data()
-
-                    # 触发Dataset中对skip config的更新
-                    # 注意：train_data_iterator 在非 TP-rank-0 的 rank 上为 None，
-                    # 不通过 train_data_iterator.iterable._dataset 访问, 直接使用全局缓存的 train_ds（BlendedDataset 实例）。
-                    if train_ds is not None and hasattr(train_ds, 'set_skip_config'):
-                        train_ds.set_skip_config()
-
-                    # 处理完成以后，触发快恢：再次拉起train的逻辑
-                    continue
+                    arsenal_retrain = True
                 else:
                     print_rank_0(f"Error in training: {e}")
                     raise e
             else:
                 print_rank_0(f"train() finished, exit training...")
                 break
+            
+            if arsenal_retrain:
+                # 重新创建dataloader相关的进程之前，把原来创建的dataloader相关的进程销毁掉
+                destroy_train_valid_test_data_loaders_and_iterators(
+                    train_data_iterator=train_data_iterator,
+                    valid_data_iterator=valid_data_iterator,
+                    test_data_iterator=test_data_iterator,
+                )
+
+                # 释放model, optimizer, opt_param_scheduler, config的占用的显存和内存资源
+                del model
+                del optimizer
+                del opt_param_scheduler
+                del config
+                del train_data_iterator
+                del valid_data_iterator
+                del test_data_iterator
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                (
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    train_data_iterator,
+                    valid_data_iterator,
+                    test_data_iterator,
+                ) = init_model_optimizer_data()
+
+                # 触发Dataset中对skip config的更新
+                # 注意：train_data_iterator 在非 TP-rank-0 的 rank 上为 None，
+                # 不通过 train_data_iterator.iterable._dataset 访问, 直接使用全局缓存的 train_ds（BlendedDataset 实例）。
+                if train_ds is not None and hasattr(train_ds, 'set_skip_config'):
+                    train_ds.set_skip_config()
 
         print_datetime('after training is done')
 
@@ -1383,7 +1383,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if isinstance(e, ArsenalReTrainError):
             timers('optimizer').stop()
             # Empty unused memory.
-            if args.empty_unused_memory_level >= 1:
+            if args.empty_unused_memory_level >= 2:
                 torch.cuda.empty_cache()
         raise e
     timers('optimizer').stop()
