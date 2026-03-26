@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import copy
 import dataclasses
 from datetime import datetime, timedelta
 import functools
@@ -88,7 +89,7 @@ from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -138,6 +139,11 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+from megatron.training.async_utils import (
+    reset_persistent_async_worker,
+    init_persistent_async_worker,
+)
 
 global train_ds_dict, train_ds, valid_ds_dict, valid_ds, test_ds_dict, test_ds
 
@@ -673,22 +679,48 @@ def pretrain(
     valid_ds = None
     test_ds = None
 
-    def init_model_optimizer_data():
-        # Model, optimizer, and learning rate.
-        timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, model_type, checkpointing_context=checkpointing_context
+    # Model, optimizer, and learning rate.
+    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        model_provider, model_type, checkpointing_context=checkpointing_context
+    )
+
+    timers('model-and-optimizer-setup').stop()
+    print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+    config = get_model_config(model[0])
+    config_backup = copy.deepcopy(config)
+    
+    def reload_config_and_checkpoint():
+        nonlocal config
+        config = copy.deepcopy(config_backup)
+        one_logger = get_one_logger()
+        one_logger and one_logger.log_metrics(
+            {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
+        )
+        timers('load-checkpoint', log_level=0).start(barrier=True)
+
+        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context=checkpointing_context,
+            skip_load_to_model_and_opt=HAVE_FSDP2
+            and getattr(args, "use_torch_fsdp2", False)
+            and args.ckpt_format == "torch_dist",
+        )
+        timers('load-checkpoint').stop(barrier=True)
+        timers.log(['load-checkpoint'])
+        one_logger and one_logger.log_metrics(
+            {
+                'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
+                'load_checkpoint_time': timers('load-checkpoint').active_time(),
+            }
         )
 
-        timers('model-and-optimizer-setup').stop()
-        print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-        config = get_model_config(model[0])
-
+    def build_data_iterators():
         # Data stuff.
         app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
         timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-
-
         if args.virtual_pipeline_model_parallel_size is not None:
             train_data_iterator = []
             valid_data_iterator = []
@@ -715,24 +747,16 @@ def pretrain(
         print_datetime('after dataloaders are built')
         app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
         return (
-            model,
-            optimizer,
-            opt_param_scheduler,
-            config,
             train_data_iterator,
             valid_data_iterator,
             test_data_iterator,
         )
 
     (
-        model,
-        optimizer,
-        opt_param_scheduler,
-        config,
         train_data_iterator,
         valid_data_iterator,
         test_data_iterator,
-    ) = init_model_optimizer_data()
+    ) = build_data_iterators()
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
         args.train_iters,
@@ -799,39 +823,48 @@ def pretrain(
                 break
             
             if arsenal_retrain:
+                torch.cuda.synchronize()
                 # 重新创建dataloader相关的进程之前，把原来创建的dataloader相关的进程销毁掉
                 destroy_train_valid_test_data_loaders_and_iterators(
                     train_data_iterator=train_data_iterator,
                     valid_data_iterator=valid_data_iterator,
                     test_data_iterator=test_data_iterator,
                 )
-
-                # 释放model, optimizer, opt_param_scheduler, config的占用的显存和内存资源
-                del model
-                del optimizer
-                del opt_param_scheduler
-                del config
                 del train_data_iterator
                 del valid_data_iterator
                 del test_data_iterator
-                gc.collect()
-                torch.cuda.empty_cache()
+                
+                destroy_global_memory_buffer()
+                reset_persistent_async_worker()
+                
+                clear_aux_losses_tracker()
+
+                for _ in range(3):
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    time.sleep(1)
+                
+                reload_config_and_checkpoint()
 
                 (
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    config,
                     train_data_iterator,
                     valid_data_iterator,
                     test_data_iterator,
-                ) = init_model_optimizer_data()
+                ) = build_data_iterators()
 
                 # 触发Dataset中对skip config的更新
-                # 注意：train_data_iterator 在非 TP-rank-0 的 rank 上为 None，
+                # 注意：train_data_iterator 在有些 rank 上为 None，
                 # 不通过 train_data_iterator.iterable._dataset 访问, 直接使用全局缓存的 train_ds（BlendedDataset 实例）。
                 if train_ds is not None and hasattr(train_ds, 'set_skip_config'):
                     train_ds.set_skip_config()
+                
+                if args.async_save and args.use_persistent_ckpt_worker:
+                    init_persistent_async_worker()
+                
+                if should_disable_forward_pre_hook(args):
+                    enable_forward_pre_hook(model)
 
         print_datetime('after training is done')
 
@@ -2280,6 +2313,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
+    cuda_graph_helper = None
     if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
@@ -2606,6 +2640,26 @@ def train(
         ft_integration.shutdown()
         one_logger_utils.finish()
         timers('interval-time').stop()
+        
+        del cuda_graph_helper
+        del prof
+        del buffered_rollouts
+        #del loss_dict
+        del total_loss_dict
+        del train_data_iterator
+        del valid_data_iterator
+
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        if model is not None:
+            for model_module in model:
+                model_module.zero_grad_buffer()
+
+        from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+        import megatron.core.transformer.utils as transformer_utils
+        delete_cuda_graphs()
+        transformer_utils.cuda_graph_attr_cache = None
+
         raise arsenal_exception
 
     return iteration, num_floating_point_operations_so_far
@@ -2955,20 +3009,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         if isinstance(build_train_valid_test_datasets_provider, functools.partial):
             vp_stage = build_train_valid_test_datasets_provider.keywords.get("vp_stage")
         
-        if vp_stage not in train_ds_dict:
-            train_ds = None
-        else:
-            train_ds = train_ds_dict[vp_stage]
-        
-        if vp_stage not in valid_ds_dict:
-            valid_ds = None
-        else:
-            valid_ds = valid_ds_dict[vp_stage]
-        
-        if vp_stage not in test_ds_dict:
-            test_ds = None
-        else:
-            test_ds = test_ds_dict[vp_stage]
+        train_ds = train_ds_dict[vp_stage] if vp_stage in train_ds_dict else None
+        valid_ds = valid_ds_dict[vp_stage] if vp_stage in valid_ds_dict else None
+        test_ds = test_ds_dict[vp_stage] if vp_stage in test_ds_dict else None
         
         # 如果之前已经build过，那么不再重新build，节省时间
         if train_ds is None and valid_ds is None and test_ds is None:
