@@ -809,11 +809,6 @@ def pretrain(
             except Exception as e:
                 if isinstance(e, ArsenalReTrainError):
                     print_rank_0(f"arsenal retrain - {e}")
-                    # 从args.load中读取arsenal_retrain_step.txt的值，并赋值给args.ckpt_step
-                    arsenal_retrain_file = os.path.join(args.load, 'arsenal_retrain_step.txt')
-                    args.ckpt_step = int(open(arsenal_retrain_file, 'r').read().strip())
-                    assert args.ckpt_step > 0, f"arsenal retrain - ckpt_step:{args.ckpt_step} is not valid, please check the file: {arsenal_retrain_file}"
-                    print_rank_0(f"arsenal retrain - to use ckpt_step: {args.ckpt_step} to retrain")
                     arsenal_retrain = True
                 else:
                     print_rank_0(f"Error in training: {e}")
@@ -824,6 +819,16 @@ def pretrain(
             
             if arsenal_retrain:
                 torch.cuda.synchronize()
+
+                optimizer.zero_grad(set_to_none=True)
+                for model_module in model:
+                    model_module.zero_grad_buffer()
+
+                from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+                import megatron.core.transformer.utils as transformer_utils
+                delete_cuda_graphs()
+                transformer_utils.cuda_graph_attr_cache = None
+
                 # 重新创建dataloader相关的进程之前，把原来创建的dataloader相关的进程销毁掉
                 destroy_train_valid_test_data_loaders_and_iterators(
                     train_data_iterator=train_data_iterator,
@@ -846,6 +851,13 @@ def pretrain(
                     gc.collect()
                     time.sleep(1)
                 
+                # 从args.load中读取arsenal_retrain_step.txt的值，并赋值给args.ckpt_step
+                arsenal_retrain_file = os.path.join(args.load, 'arsenal_retrain_step.txt')
+                args.ckpt_step = int(open(arsenal_retrain_file, 'r').read().strip())
+                assert args.ckpt_step > 0, f"arsenal retrain - ckpt_step:{args.ckpt_step} is not valid, please check the file: {arsenal_retrain_file}"
+                print_rank_0(f"arsenal retrain - to use ckpt_step: {args.ckpt_step} to retrain")
+
+                opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
                 reload_config_and_checkpoint()
 
                 (
@@ -2648,17 +2660,6 @@ def train(
         del total_loss_dict
         del train_data_iterator
         del valid_data_iterator
-
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-        if model is not None:
-            for model_module in model:
-                model_module.zero_grad_buffer()
-
-        from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-        import megatron.core.transformer.utils as transformer_utils
-        delete_cuda_graphs()
-        transformer_utils.cuda_graph_attr_cache = None
 
         raise arsenal_exception
 
