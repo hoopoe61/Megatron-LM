@@ -189,10 +189,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator').stop()
 
     packed_seq_params = None
+    cur_device = tokens.device
+    seq_length = tokens.size(1)
     if args.reset_attention_mask:
-        # 根据attention_mask生成cu_seq_len的内容
-        # attention_mask: [B, 1, S, S]; mask_to_seq_lens 输出当前 batch 每条样本的长度
-        assert args.create_attention_mask_in_dataloader and attention_mask is not None, "attention_mask must be created in dataloader when reset_attention_mask is enabled"
         all_seq_lens = []
         if position_ids is not None:
             for i in range(position_ids.size(0)):
@@ -200,6 +199,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 seq_lens_b = pos_ids_to_seq_lens(position_ids[i])
                 all_seq_lens.append(seq_lens_b)
         else:
+            # 根据attention_mask生成cu_seq_len的内容
+            # attention_mask: [B, 1, S, S]; mask_to_seq_lens 输出当前 batch 每条样本的长度
+            assert args.create_attention_mask_in_dataloader and attention_mask is not None, "attention_mask must be created in dataloader when reset_attention_mask is enabled"
             for i in range(attention_mask.size(0)):
                 # 通过 attention_mask 还原该样本的文档长度分布
                 seq_lens_b = mask_to_seq_lens(attention_mask[i, 0])
@@ -210,7 +212,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         #    position_ids = None
 
         cu_seqlens = torch.empty(
-            all_seq_lens.numel() + 1, dtype=torch.int32, device=attention_mask.device
+            all_seq_lens.numel() + 1, dtype=torch.int32, device=cur_device
         )
         cu_seqlens[0] = 0
         torch.cumsum(all_seq_lens, dim=0, dtype=torch.int32, out=cu_seqlens[1:])
@@ -219,7 +221,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             max_seqlens = int(all_seq_lens.max())
         else:
             # 如果没有使用reset_position_ids，则max_seqlens为实际的seq length
-            max_seqlens = int(attention_mask.size(2))
+            max_seqlens = int(seq_length)
             if position_ids is not None:
                 batch_size = int(position_ids.size(0))
                 position_ids = torch.arange(max_seqlens,dtype=torch.long,device=position_ids.device,).unsqueeze(0).expand(batch_size, max_seqlens).contiguous()
